@@ -1,10 +1,9 @@
-# ZLMA-Based Bollinger Band Strategy with Kalman Price + Min-Diff Filter (AMD & XLE, 2020-2024)
+# ZLMA-BB Kalman Strategy (Min-Diff) vs Buy-and-Hold (AMD & XLE, 2020-2024)
 # --------------------------------------------------------------------------------
-# • Bands: ZLMA ± 1.8 σ of Kalman price (window 25).
-# • **Buy**  when Kalman crosses up through the LOWER band **and** the gap is ≥ MIN_DIFF_PCT.
-# • **Sell** when Kalman crosses down through the UPPER band **and** the gap is ≥ MIN_DIFF_PCT.
-# • Gap is measured as |Kal-Band| / Band × 100.
-# • Position size 30 %, commission 0.5 %.
+# Strategy part unchanged from last version (Kalman price vs ZLMA-based bands).
+# Added: buy-and-hold benchmark using the same initial capital split equally
+# between AMD and XLE on the first trading day (no commission, passive hold).
+# Final report prints both ending values and % returns for easy comparison.
 # --------------------------------------------------------------------------------
 
 import pandas as pd, numpy as np, yfinance as yf
@@ -12,21 +11,21 @@ import pandas as pd, numpy as np, yfinance as yf
 START_DATE, END_DATE = "2020-01-01", "2024-12-31"
 TICKERS = ["AMD", "XLE"]
 INITIAL_CAPITAL = 100_000
-TRADE_PCT = 0.40
+TRADE_PCT = 0.55
 FEE_PCT   = 0.005
-MIN_DIFF_PCT = 0.8    # minimum % gap Kalman must clear beyond band
+MIN_DIFF_PCT = 0.8
 RISK_FREE_RATE, TRADING_DAYS = 0.0, 252
 
 LEN_ZLMA = 25
-BB_MULT  = 0.01
-KF_Q, KF_R = 0.02, 0.08
+BB_MULT  = 0.02
+KF_Q, KF_R = 0.015, 0.085
 
 # ----------------------------------------------------------------------------
 # Kalman filter
 # ----------------------------------------------------------------------------
 
 def kalman_filter(series, q=KF_Q, r=KF_R):
-    x = np.empty_like(series, dtype="float64"); p=1.0; x_prev=series.iloc[0]; x[0]=x_prev
+    x = np.empty_like(series, dtype="float64"); p = 1.0; x_prev = series.iloc[0]; x[0] = x_prev
     for i in range(1, len(series)):
         p += q; k = p / (p + r)
         x_cur = x_prev + k * (series.iloc[i] - x_prev)
@@ -34,7 +33,7 @@ def kalman_filter(series, q=KF_Q, r=KF_R):
     return pd.Series(x, index=series.index)
 
 # ----------------------------------------------------------------------------
-# Zero-Lag MA
+# ZLMA
 # ----------------------------------------------------------------------------
 
 def zlma(series, length=LEN_ZLMA):
@@ -89,23 +88,20 @@ class Backtester:
                 up,  up_y  = self.d.at[dt, f"{t}_up" ], prev.at[dt, f"{t}_up" ]
                 price = self.d.at[dt, t]
 
-                # % gaps
                 gap_lo = (kal - lo) / lo * 100 if lo else 0
                 gap_up = (up - kal) / up * 100 if up else 0
 
-                # BUY: cross up through lower band with sufficient gap
-                buy_cross = (kal_y <= lo_y) and (kal > lo) and (gap_lo >= MIN_DIFF_PCT)
+                buy_cross  = (kal_y <= lo_y) and (kal > lo) and (gap_lo >= MIN_DIFF_PCT)
+                sell_cross = (kal_y >= up_y) and (kal < up) and (gap_up >= MIN_DIFF_PCT)
+
                 if self.hold[t] == 0 and buy_cross:
-                    spend = self.cash * TRADE_PCT
-                    sh = int(spend // (price * (1 + FEE_PCT)))
+                    spend = self.cash * TRADE_PCT; sh = int(spend // (price * (1 + FEE_PCT)))
                     if sh:
                         cost = sh * price; fee = cost * FEE_PCT
                         self.cash -= cost + fee; self.hold[t] = sh
                         self.trades.append(dict(date=dt, ticker=t, act="BUY", sh=sh, px=price, fee=fee))
-                    continue  # skip sell check same bar
+                    continue
 
-                # SELL: cross down through upper band with sufficient gap
-                sell_cross = (kal_y >= up_y) and (kal < up) and (gap_up >= MIN_DIFF_PCT)
                 if self.hold[t] > 0 and sell_cross:
                     sh = self.hold[t]
                     proceeds = sh * price; fee = proceeds * FEE_PCT
@@ -116,6 +112,18 @@ class Backtester:
 
     def nav_series(self):
         d, v = zip(*self.track); return pd.Series(v, index=d)
+
+# ----------------------------------------------------------------------------
+# Buy-and-Hold Benchmark
+# ----------------------------------------------------------------------------
+
+def buy_and_hold(closes):
+    first_day = closes.index[0]; last_day = closes.index[-1]
+    alloc = INITIAL_CAPITAL / len(TICKERS)
+    shares = {t: alloc // closes.at[first_day, t] for t in TICKERS}
+    leftover = INITIAL_CAPITAL - sum(shares[t] * closes.at[first_day, t] for t in TICKERS)
+    final_value = leftover + sum(shares[t] * closes.at[last_day, t] for t in TICKERS)
+    return final_value
 
 # ----------------------------------------------------------------------------
 # Sharpe
@@ -132,10 +140,16 @@ def sharpe(nav):
 if __name__ == "__main__":
     prices = get_prices(); data = add_indicators(prices)
     bt = Backtester(data, INITIAL_CAPITAL)
-    final = bt.run(); nav = bt.nav_series(); sr = sharpe(nav)
+    strat_final = bt.run(); strat_nav = bt.nav_series(); strat_sharpe = sharpe(strat_nav)
 
-    print("\n====== ZLMA-BB Kalman Strategy (Min-Diff) Backtest ======")
-    print(f"Final value: ${final:,.2f}  |  Return: {(final/INITIAL_CAPITAL-1):.2%}  |  Sharpe: {sr:.3f}\n")
-    log = pd.DataFrame(bt.trades); print("Trades:" if not log.empty else "No trades.")
+    hold_final = buy_and_hold(prices)
+
+    print("\n====== ZLMA-BB Kalman Strategy vs Buy-and-Hold ======")
+    print("Period:", START_DATE, "→", END_DATE)
+    print(f"Strategy final value:     ${strat_final:,.2f}  |  Return: {(strat_final/INITIAL_CAPITAL-1):.2%}  |  Sharpe: {strat_sharpe:.3f}")
+    print(f"Buy-and-hold final value: ${hold_final:,.2f}  |  Return: {(hold_final/INITIAL_CAPITAL-1):.2%}\n")
+
+    log = pd.DataFrame(bt.trades)
+    print("Trades:" if not log.empty else "No trades.")
     if not log.empty:
         print(log.to_string(index=False))
